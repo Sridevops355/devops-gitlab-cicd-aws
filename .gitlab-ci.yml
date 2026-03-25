@@ -1,0 +1,375 @@
+# ============================================================
+# GitLab CI/CD Pipeline
+# Project: devops-gitlab-cicd-aws
+# Author:  Srikanth Nannapaneni (sridevops3551)
+# Stack:   Python Flask → Docker → AWS ECR → AWS ECS Fargate
+# ============================================================
+
+image: python:3.11-slim
+
+# ------------------------------------
+# Pipeline stages - run in sequence
+# ------------------------------------
+stages:
+  - validate
+  - test
+  - build
+  - scan
+  - deploy-staging
+  - integration-test
+  - deploy-production
+
+# ------------------------------------
+# Global variables
+# ------------------------------------
+variables:
+  APP_NAME: devops-cicd-demo
+  ECR_REGISTRY: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
+  ECR_REPO: ${ECR_REGISTRY}/${APP_NAME}
+  IMAGE_TAG: ${CI_COMMIT_SHORT_SHA}
+  STAGING_CLUSTER: devops-demo-staging
+  PROD_CLUSTER: devops-demo-prod
+  STAGING_SERVICE: ${APP_NAME}-staging
+  PROD_SERVICE: ${APP_NAME}-prod
+  TASK_FAMILY: ${APP_NAME}-task
+
+# ------------------------------------
+# Reusable YAML anchors
+# ------------------------------------
+.aws_setup: &aws_setup
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq awscli curl
+    - aws configure set region ${AWS_DEFAULT_REGION}
+    - echo "Logging in to ECR..."
+    - aws ecr get-login-password --region ${AWS_DEFAULT_REGION} |
+      docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+.docker_setup: &docker_setup
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_DRIVER: overlay2
+
+# ============================================================
+# STAGE 1: VALIDATE
+# Lint code and validate configs before anything else
+# ============================================================
+
+lint:
+  stage: validate
+  script:
+    - pip install --quiet flake8 pylint
+    - echo "Running flake8 linter..."
+    - flake8 app/ --max-line-length=120 --exclude=__pycache__
+    - echo "Lint passed."
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+validate-dockerfile:
+  stage: validate
+  image: hadolint/hadolint:latest-debian
+  script:
+    - echo "Linting Dockerfile..."
+    - hadolint Dockerfile
+    - echo "Dockerfile is valid."
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ============================================================
+# STAGE 2: TEST
+# Unit tests with coverage reporting
+# ============================================================
+
+unit-tests:
+  stage: test
+  script:
+    - pip install --quiet -r app/requirements.txt
+    - echo "Running unit tests with coverage..."
+    - pytest tests/
+      --cov=app
+      --cov-report=xml:coverage.xml
+      --cov-report=term-missing
+      --cov-fail-under=70
+      -v
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    expire_in: 7 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+# ============================================================
+# STAGE 3: BUILD
+# Build Docker image and push to AWS ECR
+# ============================================================
+
+build-and-push:
+  stage: build
+  <<: *docker_setup
+  <<: *aws_setup
+  script:
+    - echo "Building Docker image: ${ECR_REPO}:${IMAGE_TAG}"
+    - docker build
+      --build-arg APP_VERSION=${IMAGE_TAG}
+      --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+      --tag ${ECR_REPO}:${IMAGE_TAG}
+      --tag ${ECR_REPO}:latest
+      .
+    - echo "Pushing image to ECR..."
+    - docker push ${ECR_REPO}:${IMAGE_TAG}
+    - docker push ${ECR_REPO}:latest
+    - echo "IMAGE_TAG=${IMAGE_TAG}" > build.env
+    - echo "ECR_REPO=${ECR_REPO}" >> build.env
+    - echo "Build complete. Image: ${ECR_REPO}:${IMAGE_TAG}"
+  artifacts:
+    reports:
+      dotenv: build.env
+    expire_in: 1 day
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+# ============================================================
+# STAGE 4: SCAN
+# Security scan the Docker image with Trivy
+# ============================================================
+
+security-scan:
+  stage: scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  <<: *aws_setup
+  script:
+    - echo "Running Trivy security scan on ${ECR_REPO}:${IMAGE_TAG}..."
+    - trivy image
+      --exit-code 0
+      --severity HIGH,CRITICAL
+      --format template
+      --template "@/contrib/gitlab.tpl"
+      --output gl-container-scanning-report.json
+      ${ECR_REPO}:${IMAGE_TAG}
+    - trivy image
+      --exit-code 1
+      --severity CRITICAL
+      ${ECR_REPO}:${IMAGE_TAG}
+  artifacts:
+    reports:
+      container_scanning: gl-container-scanning-report.json
+    expire_in: 7 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+# ============================================================
+# STAGE 5: DEPLOY TO STAGING
+# Update ECS Fargate service in staging environment
+# ============================================================
+
+deploy-staging:
+  stage: deploy-staging
+  <<: *aws_setup
+  environment:
+    name: staging
+    url: http://${STAGING_ALB_DNS}
+  script:
+    - echo "Deploying ${IMAGE_TAG} to STAGING..."
+
+    # Register new task definition with updated image
+    - |
+      TASK_DEF=$(aws ecs describe-task-definition \
+        --task-definition ${TASK_FAMILY}-staging \
+        --query 'taskDefinition' \
+        --output json)
+
+      NEW_TASK_DEF=$(echo $TASK_DEF | python3 -c "
+      import json, sys
+      td = json.load(sys.stdin)
+      for c in td['containerDefinitions']:
+          if c['name'] == '${APP_NAME}':
+              c['image'] = '${ECR_REPO}:${IMAGE_TAG}'
+              c['environment'] = [
+                  {'name': 'ENVIRONMENT', 'value': 'staging'},
+                  {'name': 'APP_VERSION', 'value': '${IMAGE_TAG}'}
+              ]
+      keys_to_remove = ['taskDefinitionArn','revision','status','requiresAttributes',
+                        'compatibilities','registeredAt','registeredBy']
+      [td.pop(k, None) for k in keys_to_remove]
+      print(json.dumps(td))
+      ")
+
+      NEW_TASK_ARN=$(aws ecs register-task-definition \
+        --cli-input-json "$NEW_TASK_DEF" \
+        --query 'taskDefinition.taskDefinitionArn' \
+        --output text)
+
+      echo "New task ARN: $NEW_TASK_ARN"
+
+    # Update the ECS service
+    - |
+      aws ecs update-service \
+        --cluster ${STAGING_CLUSTER} \
+        --service ${STAGING_SERVICE} \
+        --task-definition ${NEW_TASK_ARN} \
+        --force-new-deployment
+
+    # Wait for deployment to stabilise
+    - echo "Waiting for staging deployment to stabilise..."
+    - |
+      aws ecs wait services-stable \
+        --cluster ${STAGING_CLUSTER} \
+        --services ${STAGING_SERVICE}
+
+    - echo "Staging deployment complete."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ============================================================
+# STAGE 6: INTEGRATION TESTS
+# Run smoke tests against staging environment
+# ============================================================
+
+integration-tests:
+  stage: integration-test
+  script:
+    - pip install --quiet requests pytest
+    - echo "Running integration tests against staging..."
+    - |
+      python3 -c "
+      import requests, sys, time
+
+      base_url = 'http://${STAGING_ALB_DNS}'
+      max_retries = 5
+
+      for i in range(max_retries):
+          try:
+              r = requests.get(f'{base_url}/health', timeout=10)
+              if r.status_code == 200:
+                  print(f'Health check passed: {r.json()}')
+                  break
+          except Exception as e:
+              print(f'Attempt {i+1}/{max_retries}: {e}')
+              time.sleep(10)
+      else:
+          print('Health check failed after retries')
+          sys.exit(1)
+
+      # Test all endpoints
+      endpoints = ['/', '/health', '/ready']
+      for ep in endpoints:
+          r = requests.get(f'{base_url}{ep}', timeout=10)
+          assert r.status_code == 200, f'FAILED: {ep} returned {r.status_code}'
+          print(f'PASSED: {ep} -> {r.status_code}')
+
+      print('All integration tests passed.')
+      "
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ============================================================
+# STAGE 7: DEPLOY TO PRODUCTION
+# Manual gate — requires explicit approval
+# ============================================================
+
+deploy-production:
+  stage: deploy-production
+  <<: *aws_setup
+  environment:
+    name: production
+    url: http://${PROD_ALB_DNS}
+  when: manual
+  script:
+    - echo "=== PRODUCTION DEPLOYMENT ==="
+    - echo "Image: ${ECR_REPO}:${IMAGE_TAG}"
+    - echo "Cluster: ${PROD_CLUSTER}"
+
+    # Register new task definition for production
+    - |
+      TASK_DEF=$(aws ecs describe-task-definition \
+        --task-definition ${TASK_FAMILY}-prod \
+        --query 'taskDefinition' \
+        --output json)
+
+      NEW_TASK_DEF=$(echo $TASK_DEF | python3 -c "
+      import json, sys
+      td = json.load(sys.stdin)
+      for c in td['containerDefinitions']:
+          if c['name'] == '${APP_NAME}':
+              c['image'] = '${ECR_REPO}:${IMAGE_TAG}'
+              c['environment'] = [
+                  {'name': 'ENVIRONMENT', 'value': 'production'},
+                  {'name': 'APP_VERSION', 'value': '${IMAGE_TAG}'}
+              ]
+      keys_to_remove = ['taskDefinitionArn','revision','status','requiresAttributes',
+                        'compatibilities','registeredAt','registeredBy']
+      [td.pop(k, None) for k in keys_to_remove]
+      print(json.dumps(td))
+      ")
+
+      NEW_TASK_ARN=$(aws ecs register-task-definition \
+        --cli-input-json "$NEW_TASK_DEF" \
+        --query 'taskDefinition.taskDefinitionArn' \
+        --output text)
+
+    # Blue/green style rolling update
+    - |
+      aws ecs update-service \
+        --cluster ${PROD_CLUSTER} \
+        --service ${PROD_SERVICE} \
+        --task-definition ${NEW_TASK_ARN} \
+        --deployment-configuration "maximumPercent=200,minimumHealthyPercent=100" \
+        --force-new-deployment
+
+    - echo "Waiting for production deployment to stabilise..."
+    - |
+      aws ecs wait services-stable \
+        --cluster ${PROD_CLUSTER} \
+        --services ${PROD_SERVICE}
+
+    - echo "Production deployment complete. Version ${IMAGE_TAG} is live."
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+
+# ============================================================
+# NOTIFICATIONS
+# Notify on pipeline failure
+# ============================================================
+
+notify-failure:
+  stage: deploy-production
+  script:
+    - echo "Pipeline FAILED for ${CI_COMMIT_BRANCH} at ${CI_JOB_STAGE}"
+    - |
+      curl -s -X POST ${SLACK_WEBHOOK_URL} \
+        -H 'Content-type: application/json' \
+        --data "{
+          \"text\": \":red_circle: Pipeline failed on *${CI_COMMIT_BRANCH}*\",
+          \"attachments\": [{
+            \"color\": \"danger\",
+            \"fields\": [
+              {\"title\": \"Stage\", \"value\": \"${CI_JOB_STAGE}\", \"short\": true},
+              {\"title\": \"Commit\", \"value\": \"${CI_COMMIT_SHORT_SHA}\", \"short\": true},
+              {\"title\": \"Author\", \"value\": \"${CI_COMMIT_AUTHOR}\", \"short\": true},
+              {\"title\": \"Pipeline\", \"value\": \"${CI_PIPELINE_URL}\", \"short\": false}
+            ]
+          }]
+        }"
+  when: on_failure
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
