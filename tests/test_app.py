@@ -18,8 +18,18 @@ def test_index_returns_200(client):
     assert response.status_code == 200
 
 
-def test_index_returns_json(client):
+def test_index_returns_html(client):
     response = client.get("/")
+    assert b"CI/CD Pipeline" in response.data
+
+
+def test_api_returns_200(client):
+    response = client.get("/api")
+    assert response.status_code == 200
+
+
+def test_api_returns_json(client):
+    response = client.get("/api")
     data = response.get_json()
     assert data is not None
     assert "message" in data
@@ -41,15 +51,3 @@ def test_health_check_returns_healthy(client):
 def test_ready_check_returns_200(client):
     response = client.get("/ready")
     assert response.status_code == 200
-
-
-def test_app_version_in_response(client):
-    response = client.get("/")
-    data = response.get_json()
-    assert "version" in data
-
-
-def test_environment_in_response(client):
-    response = client.get("/")
-    data = response.get_json()
-    assert "environment" in data

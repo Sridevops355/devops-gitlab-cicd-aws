@@ -1,4 +1,4 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, render_template
 import os
 import logging
 
@@ -13,6 +13,15 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
 
 @app.route("/")
 def index():
+    return render_template(
+        "index.html",
+        version=APP_VERSION,
+        environment=ENVIRONMENT
+    )
+
+
+@app.route("/api")
+def api():
     return jsonify({
         "message": "DevOps GitLab CI/CD Demo App",
         "version": APP_VERSION,
